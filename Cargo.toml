@@ -1,0 +1,24 @@
+[package]
+name = "phil"
+version = "0.1.0"
+authors = ["Sam Kirby <sam.kirby94@hotmail.co.uk>"]
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-futures = "0.2"
+
+[dependencies.songbird]
+features = ["builtin-queue"]
+#path = "../../../"
+version = "0.2"
+
+[dependencies.serenity]
+version = "0.10"
+features = ["cache", "standard_framework", "voice", "rustls_backend"]
+
+[dependencies.tokio]
+version = "1.0"
+features = ["macros", "rt-multi-thread"]
