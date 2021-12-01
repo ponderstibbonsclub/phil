@@ -4,6 +4,10 @@ version = "0.1.0"
 authors = ["Sam Kirby <sam.kirby94@hotmail.co.uk>"]
 edition = "2021"
 
+[profile.release]
+codegen-units = 1
+lto = true
+
 [dependencies]
 anyhow = "1"
 tracing = "0.1"
@@ -12,7 +16,6 @@ tracing-futures = "0.2"
 
 [dependencies.songbird]
 features = ["builtin-queue"]
-#path = "../../../"
 version = "0.2"
 
 [dependencies.serenity]
