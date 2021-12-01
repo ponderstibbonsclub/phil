@@ -1,11 +1,12 @@
 //! Phil Collins - the simple Discord bot for the Ponder Stibbons Club
 //!
 //! Modified from Songbird voice_events_queue example
-use std::{env, sync::Arc};
+use std::{env, time::Duration};
 
 use anyhow::Context;
 use serenity::{
     async_trait,
+    builder::CreateMessage,
     client::{Client, Context as DiscordContext, EventHandler},
     framework::{
         standard::{
@@ -14,14 +15,14 @@ use serenity::{
         },
         StandardFramework,
     },
-    http::Http,
-    model::{channel::Message, gateway::Ready, misc::Mentionable, prelude::ChannelId},
+    model::{channel::Message, gateway::Ready, guild::Member, id::ChannelId, misc::Mentionable},
+    utils::Colour,
     Result as SerenityResult,
 };
 
 use songbird::{
-    input::restartable::Restartable, Event, EventContext, EventHandler as VoiceEventHandler,
-    SerenityInit, TrackEvent,
+    input::{restartable::Restartable, Metadata},
+    Event, EventContext, EventHandler as SongbirdEventHandler, SerenityInit, TrackEvent,
 };
 
 struct Handler;
@@ -33,29 +34,58 @@ impl EventHandler for Handler {
     }
 }
 
-struct TrackEndNotifier {
-    chan_id: ChannelId,
-    http: Arc<Http>,
+struct TrackStartNotifier {
+    channel_id: ChannelId,
+    ctx: DiscordContext,
 }
 
 #[async_trait]
-impl VoiceEventHandler for TrackEndNotifier {
+impl SongbirdEventHandler for TrackStartNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::Track(track_list) = ctx {
+            let meta = track_list
+                .first()
+                .expect("Something must be starting")
+                .1
+                .metadata()
+                .clone();
             check_msg(
-                self.chan_id
-                    .say(&self.http, &format!("Tracks ended: {}.", track_list.len()))
+                self.channel_id
+                    .send_message(&self.ctx.http, |m| {
+                        track_embed(m, &meta, QueuePos::Now, None);
+                        m
+                    })
                     .await,
             );
+            // self.ctx
+            //     .set_presence(
+            //         Some(Activity::playing(
+            //             meta.title.unwrap_or_else(|| "untitled".to_string()),
+            //         )),
+            //         OnlineStatus::Online,
+            //     )
+            //     .await;
         }
 
         None
     }
 }
 
+// struct TrackPauseNotifier {
+//     ctx: DiscordContext,
+// }
+
+// #[async_trait]
+// impl SongbirdEventHandler for TrackPauseNotifier {
+//     async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+//         self.ctx.set_presence(None, OnlineStatus::Idle).await;
+//         None
+//     }
+// }
+
 #[group]
 #[commands(
-    join, leave, mute, pause, play, queue, remove, resume, skip, stop, unmute, volume
+    join, leave, mute, pause, play, playi, plays, queue, remove, resume, skip, stop, unmute, volume
 )]
 struct General;
 
@@ -118,19 +148,19 @@ async fn join(ctx: &DiscordContext, msg: &Message) -> CommandResult {
                 .await,
         );
 
-        let chan_id = msg.channel_id;
-
-        let send_http = ctx.http.clone();
-
         let mut handle = handle_lock.lock().await;
 
         handle.add_global_event(
-            Event::Track(TrackEvent::End),
-            TrackEndNotifier {
-                chan_id,
-                http: send_http,
+            Event::Track(TrackEvent::Play),
+            TrackStartNotifier {
+                channel_id: msg.channel_id,
+                ctx: ctx.clone(),
             },
         );
+        // handle.add_global_event(
+        //     Event::Track(TrackEvent::Pause),
+        //     TrackPauseNotifier { ctx: ctx.clone() },
+        // )
     } else {
         check_msg(
             msg.channel_id
@@ -225,7 +255,7 @@ async fn pause(ctx: &DiscordContext, msg: &Message) -> CommandResult {
 
         check_msg(
             msg.channel_id
-                .say(&ctx.http, format!("Playback paused"))
+                .say(&ctx.http, "Playback paused".to_string())
                 .await,
         );
     } else {
@@ -299,6 +329,13 @@ async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult 
             )
         };
 
+        let pos = match length {
+            0 => unreachable!(),
+            1 => QueuePos::Now,
+            2 => QueuePos::Next,
+            n => QueuePos::Later(n),
+        };
+
         let blame = msg
             .member(&ctx)
             .await
@@ -307,22 +344,171 @@ async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult 
         check_msg(
             msg.channel_id
                 .send_message(&ctx.http, |m| {
-                    m.embed(|e| {
-                        e.title(track.title.unwrap_or_else(|| "Untitled".to_string()));
-                        if let Some(url) = track.thumbnail {
-                            e.thumbnail(url);
-                        }
-                        if let Some(artist) = track.artist {
-                            e.description(format!("By {}", artist));
-                        }
-                        if length > 1 {
-                            e.field("Position", length, true);
-                        }
-                        e.footer(|f| {
-                            f.text(format!("Queued by {}", blame.display_name()));
-                            f
-                        })
-                    });
+                    track_embed(m, &track, pos, Some(blame));
+                    m
+                })
+                .await,
+        );
+    } else {
+        check_msg(
+            msg.channel_id
+                .say(&ctx.http, "Not currently playing in this server")
+                .await,
+        );
+    }
+
+    Ok(())
+}
+
+#[command]
+#[only_in(guilds)]
+async fn playi(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult {
+    let query = match args.remains() {
+        Some(q) => q.to_string(),
+        None => {
+            check_msg(
+                msg.channel_id
+                    .say(&ctx.http, "You forgot to specify what to play...")
+                    .await,
+            );
+
+            return Ok(());
+        }
+    };
+
+    let guild_id = msg.guild_id.expect("Command can only be used in guilds");
+
+    let manager = songbird::get(ctx)
+        .await
+        .expect("Songbird Voice client placed in at initialisation.")
+        .clone();
+
+    if let Some(handler_lock) = manager.get(guild_id) {
+        let mut handler = handler_lock.lock().await;
+
+        let source = if query.starts_with("http") {
+            Restartable::ytdl(query, true).await
+        } else {
+            Restartable::ytdl_search(query, true).await
+        };
+        let source = match source {
+            Ok(source) => source,
+            Err(why) => {
+                tracing::error!("Err starting source: {:?}", why);
+
+                check_msg(
+                    msg.channel_id
+                        .say(&ctx.http, format!("Something went wrong!\n{}", why))
+                        .await,
+                );
+
+                return Ok(());
+            }
+        };
+
+        handler.enqueue_source(source.into());
+        let queue = handler.queue();
+        if queue.len() > 1 {
+            let queue_vec = queue.current_queue();
+            let cur_first = queue_vec.first().expect("len > 1");
+            let _ = cur_first.pause();
+            let _ = cur_first.seek_time(Duration::ZERO);
+            queue.modify_queue(|q| q.rotate_right(1));
+            let _ = queue.current().expect("len > 1").play();
+        }
+    } else {
+        check_msg(
+            msg.channel_id
+                .say(&ctx.http, "Not currently playing in this server")
+                .await,
+        );
+    }
+
+    Ok(())
+}
+
+#[command]
+#[only_in(guilds)]
+async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult {
+    let query = match args.remains() {
+        Some(q) => q.to_string(),
+        None => {
+            check_msg(
+                msg.channel_id
+                    .say(&ctx.http, "You forgot to specify what to play...")
+                    .await,
+            );
+
+            return Ok(());
+        }
+    };
+
+    let guild_id = msg.guild_id.expect("Command can only be used in guilds");
+
+    let manager = songbird::get(ctx)
+        .await
+        .expect("Songbird Voice client placed in at initialisation.")
+        .clone();
+
+    if let Some(handler_lock) = manager.get(guild_id) {
+        let mut handler = handler_lock.lock().await;
+
+        let source = if query.starts_with("http") {
+            Restartable::ytdl(query, true).await
+        } else {
+            Restartable::ytdl_search(query, true).await
+        };
+        let source = match source {
+            Ok(source) => source,
+            Err(why) => {
+                tracing::error!("Err starting source: {:?}", why);
+
+                check_msg(
+                    msg.channel_id
+                        .say(&ctx.http, format!("Something went wrong!\n{}", why))
+                        .await,
+                );
+
+                return Ok(());
+            }
+        };
+
+        handler.enqueue_source(source.into());
+        let queue = handler.queue();
+
+        let (track, length) = {
+            (
+                queue
+                    .current_queue()
+                    .last()
+                    .expect("Just queued something, it should be there")
+                    .metadata()
+                    .clone(),
+                queue.len(),
+            )
+        };
+
+        if queue.len() > 1 {
+            queue.modify_queue(|q| {
+                let t = q.pop_back().unwrap();
+                q.insert(1, t);
+            });
+        }
+
+        let pos = match length {
+            1 => QueuePos::Now,
+            _ => QueuePos::Next,
+        };
+
+        let blame = msg
+            .member(&ctx)
+            .await
+            .expect("Member must have sent this message");
+
+        check_msg(
+            msg.channel_id
+                .send_message(&ctx.http, |m| {
+                    track_embed(m, &track, pos, Some(blame));
                     m
                 })
                 .await,
@@ -458,7 +644,7 @@ async fn resume(ctx: &DiscordContext, msg: &Message) -> CommandResult {
 
         check_msg(
             msg.channel_id
-                .say(&ctx.http, format!("Playback resumed"))
+                .say(&ctx.http, "Playback resumed".to_string())
                 .await,
         );
     } else {
@@ -656,4 +842,54 @@ fn check_msg(result: SerenityResult<Message>) {
     if let Err(why) = result {
         tracing::error!("Error sending message: {:?}", why);
     }
+}
+
+enum QueuePos {
+    Now,
+    Next,
+    Later(usize),
+}
+
+fn track_embed(
+    message: &mut CreateMessage<'_>,
+    meta: &Metadata,
+    pos: QueuePos,
+    blame: Option<Member>,
+) {
+    message.embed(|e| {
+        match pos {
+            QueuePos::Now => {
+                e.title("🎵 Now Playing 🎵");
+                e.colour(Colour::DARK_GREEN);
+            }
+            QueuePos::Next => {
+                e.title("Next Up");
+                e.colour(Colour::DARK_GREEN);
+            }
+            QueuePos::Later(pos) => {
+                e.title(format!("Queued at {}", pos));
+                e.colour(Colour::GOLD);
+            }
+        };
+
+        let mut desc = String::new();
+        if let Some(title) = &meta.title {
+            desc.push_str(title);
+        } else {
+            desc.push_str("untitled");
+        }
+        desc.push('\n');
+        if let Some(artist) = &meta.artist {
+            desc.push_str(&format!("By {}", artist));
+        }
+        e.description(desc);
+
+        if let Some(url) = &meta.thumbnail {
+            e.thumbnail(url);
+        }
+        if let Some(blame) = blame {
+            e.footer(|f| f.text(format!("Queued by {}", blame.display_name())));
+        }
+        e
+    });
 }
