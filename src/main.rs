@@ -1,7 +1,7 @@
 //! Phil Collins - the simple Discord bot for the Ponder Stibbons Club
 //!
 //! Modified from Songbird voice_events_queue example
-use std::{env, time::Duration};
+use std::{collections::HashSet, env, time::Duration};
 
 use anyhow::Context;
 use serenity::{
@@ -10,12 +10,20 @@ use serenity::{
     client::{Client, Context as DiscordContext, EventHandler},
     framework::{
         standard::{
-            macros::{command, group},
-            Args, CommandResult,
+            help_commands,
+            macros::{command, group, help},
+            Args, CommandGroup, CommandResult, HelpOptions,
         },
         StandardFramework,
     },
-    model::{channel::Message, gateway::Ready, guild::Member, id::ChannelId, misc::Mentionable},
+    http::Http,
+    model::{
+        channel::Message,
+        gateway::Ready,
+        guild::Member,
+        id::{ChannelId, UserId},
+        misc::Mentionable,
+    },
     utils::Colour,
     Result as SerenityResult,
 };
@@ -47,12 +55,11 @@ impl SongbirdEventHandler for TrackStartNotifier {
                 .first()
                 .expect("Something must be starting")
                 .1
-                .metadata()
-                .clone();
+                .metadata();
             check_msg(
                 self.channel_id
                     .send_message(&self.ctx.http, |m| {
-                        track_embed(m, &meta, QueuePos::Now, None);
+                        track_embed(m, meta, QueuePos::Now, None);
                         m
                     })
                     .await,
@@ -89,14 +96,53 @@ impl SongbirdEventHandler for TrackStartNotifier {
 )]
 struct General;
 
+#[help]
+#[command_not_found_text = "No command named: {}"]
+#[max_levenshtein_distance(3)]
+async fn help(
+    ctx: &DiscordContext,
+    msg: &Message,
+    args: Args,
+    help_options: &'static HelpOptions,
+    groups: &[&'static CommandGroup],
+    owners: HashSet<UserId>,
+) -> CommandResult {
+    let _ = help_commands::with_embeds(ctx, msg, args, help_options, groups, owners).await;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let token = env::var("DISCORD_TOKEN").context("DISCORD_TOKEN environment variable not set")?;
 
+    let (owners, bot_id) = {
+        let mut owners = HashSet::new();
+        let http = Http::new_with_token(&token);
+        let info = http
+            .get_current_application_info()
+            .await
+            .context("Failed to access application info")?;
+        match info.team {
+            Some(team) => owners.extend(team.members.iter().map(|tm| tm.user.id)),
+            None => {
+                owners.insert(info.owner.id);
+            }
+        }
+
+        let bot_id = http
+            .get_current_user()
+            .await
+            .context("Could not access current user info")?
+            .id;
+
+        (owners, bot_id)
+    };
+
     let framework = StandardFramework::new()
-        .configure(|c| c.prefix("."))
+        .configure(|c| c.prefix(".").owners(owners).on_mention(Some(bot_id)))
+        .help(&HELP)
         .group(&GENERAL_GROUP);
 
     let mut client = Client::builder(&token)
@@ -116,6 +162,8 @@ async fn main() -> anyhow::Result<()> {
 
 #[command]
 #[only_in(guilds)]
+#[aliases("j")]
+#[description("Instruct the bot to join the voice channel you are currently connected to.")]
 async fn join(ctx: &DiscordContext, msg: &Message) -> CommandResult {
     let guild = msg.guild(&ctx.cache).await.unwrap();
     let guild_id = guild.id;
@@ -174,6 +222,8 @@ async fn join(ctx: &DiscordContext, msg: &Message) -> CommandResult {
 
 #[command]
 #[only_in(guilds)]
+#[aliases("d")]
+#[description("Leave the voice channel that the bot is in.")]
 async fn leave(ctx: &DiscordContext, msg: &Message) -> CommandResult {
     let guild_id = msg.guild_id.expect("Command can only be used in guilds");
 
@@ -202,6 +252,8 @@ async fn leave(ctx: &DiscordContext, msg: &Message) -> CommandResult {
 
 #[command]
 #[only_in(guilds)]
+#[aliases("m")]
+#[description("Mute the bot's audio source. Track will continue playing, but no one will hear it.")]
 async fn mute(ctx: &DiscordContext, msg: &Message) -> CommandResult {
     let guild_id = msg.guild_id.expect("Command can only be used in guilds");
 
@@ -240,6 +292,8 @@ async fn mute(ctx: &DiscordContext, msg: &Message) -> CommandResult {
 
 #[command]
 #[only_in(guilds)]
+#[aliases("h")]
+#[description("Pause the currently playing track.")]
 async fn pause(ctx: &DiscordContext, msg: &Message) -> CommandResult {
     let guild_id = msg.guild_id.expect("Command can only be used in guilds");
 
@@ -271,6 +325,8 @@ async fn pause(ctx: &DiscordContext, msg: &Message) -> CommandResult {
 
 #[command]
 #[only_in(guilds)]
+#[aliases("p")]
+#[description("Play a specified track either by link or keyword search. It is inserted at the end of the queue.")]
 async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult {
     let query = match args.remains() {
         Some(q) => q.to_string(),
@@ -362,6 +418,8 @@ async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult 
 
 #[command]
 #[only_in(guilds)]
+#[aliases("pi")]
+#[description("Play a specified track either by link or keyword search. It will play immediately; the current track will be requeued next.")]
 async fn playi(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult {
     let query = match args.remains() {
         Some(q) => q.to_string(),
@@ -429,6 +487,8 @@ async fn playi(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
 
 #[command]
 #[only_in(guilds)]
+#[aliases("ps")]
+#[description("Play a specified track either by link or keyword search. It will play immediately after the current track finishes.")]
 async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult {
     let query = match args.remains() {
         Some(q) => q.to_string(),
@@ -526,6 +586,8 @@ async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
 
 #[command]
 #[only_in(guilds)]
+#[aliases("q", "ls")]
+#[description("Check the current queue")]
 async fn queue(ctx: &DiscordContext, msg: &Message) -> CommandResult {
     let guild_id = msg.guild_id.expect("Command can only be used in guilds");
 
@@ -574,6 +636,8 @@ async fn queue(ctx: &DiscordContext, msg: &Message) -> CommandResult {
 
 #[command]
 #[only_in(guilds)]
+#[aliases("r")]
+#[description("Remove a track from the queue, identified by index")]
 async fn remove(ctx: &DiscordContext, msg: &Message, mut args: Args) -> CommandResult {
     let position = match args.single::<usize>() {
         Ok(p) => p,
@@ -629,6 +693,8 @@ async fn remove(ctx: &DiscordContext, msg: &Message, mut args: Args) -> CommandR
 
 #[command]
 #[only_in(guilds)]
+#[aliases("c")]
+#[description("Resume playback of a paused track")]
 async fn resume(ctx: &DiscordContext, msg: &Message) -> CommandResult {
     let guild_id = msg.guild_id.expect("Command can only be used in guilds");
 
@@ -660,6 +726,8 @@ async fn resume(ctx: &DiscordContext, msg: &Message) -> CommandResult {
 
 #[command]
 #[only_in(guilds)]
+#[aliases("s")]
+#[description("Skip the current track")]
 async fn skip(ctx: &DiscordContext, msg: &Message, _args: Args) -> CommandResult {
     let guild_id = msg.guild_id.expect("Command can only be used in guilds");
 
@@ -694,6 +762,8 @@ async fn skip(ctx: &DiscordContext, msg: &Message, _args: Args) -> CommandResult
 
 #[command]
 #[only_in(guilds)]
+#[aliases("x")]
+#[description("Stop playback, clearing the bot's queue")]
 async fn stop(ctx: &DiscordContext, msg: &Message, _args: Args) -> CommandResult {
     let guild_id = msg.guild_id.expect("Command can only be used in guilds");
 
@@ -721,38 +791,8 @@ async fn stop(ctx: &DiscordContext, msg: &Message, _args: Args) -> CommandResult
 
 #[command]
 #[only_in(guilds)]
-async fn undeafen(ctx: &DiscordContext, msg: &Message) -> CommandResult {
-    let guild_id = msg.guild_id.expect("Command can only be used in guilds");
-
-    let manager = songbird::get(ctx)
-        .await
-        .expect("Songbird Voice client placed in at initialisation.")
-        .clone();
-
-    if let Some(handler_lock) = manager.get(guild_id) {
-        let mut handler = handler_lock.lock().await;
-        if let Err(e) = handler.deafen(false).await {
-            check_msg(
-                msg.channel_id
-                    .say(&ctx.http, format!("Failed: {:?}", e))
-                    .await,
-            );
-        }
-
-        check_msg(msg.channel_id.say(&ctx.http, "Undeafened").await);
-    } else {
-        check_msg(
-            msg.channel_id
-                .say(&ctx.http, "Not in a voice channel to undeafen in")
-                .await,
-        );
-    }
-
-    Ok(())
-}
-
-#[command]
-#[only_in(guilds)]
+#[aliases("um")]
+#[description("Unmute the bot's audio")]
 async fn unmute(ctx: &DiscordContext, msg: &Message) -> CommandResult {
     let guild_id = msg.guild_id.expect("Command can only be used in guilds");
 
@@ -785,6 +825,8 @@ async fn unmute(ctx: &DiscordContext, msg: &Message) -> CommandResult {
 
 #[command]
 #[only_in(guilds)]
+#[aliases("v")]
+#[description("Set the volume for the current track only")]
 async fn volume(ctx: &DiscordContext, msg: &Message, mut args: Args) -> CommandResult {
     let volume = match args.single::<f32>() {
         Ok(p) => p,
