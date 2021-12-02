@@ -141,7 +141,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let framework = StandardFramework::new()
-        .configure(|c| c.prefix(".").owners(owners).on_mention(Some(bot_id)))
+        .configure(|c| {
+            c.prefixes([".", "~"])
+                .owners(owners)
+                .on_mention(Some(bot_id))
+        })
         .help(&HELP)
         .group(&GENERAL_GROUP);
 
@@ -588,8 +592,12 @@ async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
 #[only_in(guilds)]
 #[aliases("q", "ls")]
 #[description("Check the current queue")]
-async fn queue(ctx: &DiscordContext, msg: &Message) -> CommandResult {
+async fn queue(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult {
     let guild_id = msg.guild_id.expect("Command can only be used in guilds");
+
+    if !args.is_empty() {
+        return play(ctx, msg, args).await;
+    }
 
     let manager = songbird::get(ctx)
         .await
