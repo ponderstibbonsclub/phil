@@ -1,7 +1,12 @@
 //! Phil Collins - the simple Discord bot for the Ponder Stibbons Club
 //!
 //! Modified from Songbird voice_events_queue example
-use std::{collections::{HashSet, VecDeque}, env, time::Duration, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    env,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context;
 use serenity::{
@@ -21,7 +26,7 @@ use serenity::{
         channel::Message,
         gateway::Ready,
         guild::Member,
-        id::{ChannelId, UserId, GuildId},
+        id::{ChannelId, GuildId, UserId},
         misc::Mentionable,
     },
     utils::Colour,
@@ -33,11 +38,7 @@ use songbird::{
     Event, EventContext, EventHandler as SongbirdEventHandler, SerenityInit, TrackEvent,
 };
 
-use tokio::{
-    fs::File,
-    io::AsyncReadExt,
-    sync::Mutex
-};
+use tokio::{fs::File, io::AsyncReadExt, sync::Mutex};
 
 struct Handler;
 
@@ -218,7 +219,7 @@ async fn join(ctx: &DiscordContext, msg: &Message) -> CommandResult {
 
         handle.add_global_event(
             Event::Track(TrackEvent::End),
-            DefaultQueue::new(ctx.clone(), guild_id).await
+            DefaultQueue::new(ctx.clone(), guild_id).await,
         );
 
         // handle.add_global_event(
@@ -963,7 +964,7 @@ pub struct DefaultQueue {
 }
 
 impl DefaultQueue {
-    /// Create a new empty default queue
+    /// Create a new default queue from file
     async fn new(ctx: DiscordContext, guild_id: GuildId) -> Self {
         let inner = Arc::new(Mutex::new(VecDeque::new()));
 
@@ -976,15 +977,19 @@ impl DefaultQueue {
                         for default in defaults.lines() {
                             queue.push_back(default.to_owned());
                         }
-                    },
+                    }
                     Err(why) => {
                         tracing::error!("Error reading defaults: {:?}", why);
-                    },
+                    }
                 }
             }
         }
 
-        Self { inner, ctx, guild_id }
+        Self {
+            inner,
+            ctx,
+            guild_id,
+        }
     }
 }
 
@@ -1008,11 +1013,11 @@ impl SongbirdEventHandler for DefaultQueue {
                         match source {
                             Ok(source) => {
                                 handler.enqueue_source(source.into());
-                            },
+                            }
                             Err(why) => {
                                 tracing::error!("Err starting source: {:?}", why);
                                 return None;
-                            },
+                            }
                         };
                     }
                 }
