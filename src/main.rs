@@ -1,7 +1,7 @@
 //! Phil Collins - the simple Discord bot for the Ponder Stibbons Club
 //!
 //! Modified from Songbird voice_events_queue example
-use std::{collections::HashSet, env, time::Duration};
+use std::{collections::{HashSet, VecDeque}, env, time::Duration, sync::Arc};
 
 use anyhow::Context;
 use serenity::{
@@ -21,7 +21,7 @@ use serenity::{
         channel::Message,
         gateway::Ready,
         guild::Member,
-        id::{ChannelId, UserId},
+        id::{ChannelId, UserId, GuildId},
         misc::Mentionable,
     },
     utils::Colour,
@@ -31,6 +31,12 @@ use serenity::{
 use songbird::{
     input::{restartable::Restartable, Metadata},
     Event, EventContext, EventHandler as SongbirdEventHandler, SerenityInit, TrackEvent,
+};
+
+use tokio::{
+    fs::File,
+    io::AsyncReadExt,
+    sync::Mutex
 };
 
 struct Handler;
@@ -209,6 +215,12 @@ async fn join(ctx: &DiscordContext, msg: &Message) -> CommandResult {
                 ctx: ctx.clone(),
             },
         );
+
+        handle.add_global_event(
+            Event::Track(TrackEvent::End),
+            DefaultQueue::new(ctx.clone(), guild_id).await
+        );
+
         // handle.add_global_event(
         //     Event::Track(TrackEvent::Pause),
         //     TrackPauseNotifier { ctx: ctx.clone() },
@@ -942,4 +954,71 @@ fn track_embed(
         }
         e
     });
+}
+
+pub struct DefaultQueue {
+    inner: Arc<Mutex<VecDeque<String>>>,
+    ctx: DiscordContext,
+    guild_id: GuildId,
+}
+
+impl DefaultQueue {
+    /// Create a new empty default queue
+    async fn new(ctx: DiscordContext, guild_id: GuildId) -> Self {
+        let inner = Arc::new(Mutex::new(VecDeque::new()));
+
+        if let Ok(path) = env::var("PHIL_DEFAULT") {
+            if let Ok(mut file) = File::open(path).await {
+                let mut defaults = String::new();
+                match file.read_to_string(&mut defaults).await {
+                    Ok(_) => {
+                        let mut queue = inner.lock().await;
+                        for default in defaults.lines() {
+                            queue.push_back(default.to_owned());
+                        }
+                    },
+                    Err(why) => {
+                        tracing::error!("Error reading defaults: {:?}", why);
+                    },
+                }
+            }
+        }
+
+        Self { inner, ctx, guild_id }
+    }
+}
+
+#[async_trait]
+impl SongbirdEventHandler for DefaultQueue {
+    async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+        let mut defaults = self.inner.lock().await;
+        if !defaults.is_empty() {
+            if let Some(manager) = songbird::get(&self.ctx).await.clone() {
+                if let Some(handler_lock) = manager.get(self.guild_id) {
+                    let mut handler = handler_lock.lock().await;
+                    let queue = handler.queue().current_queue();
+
+                    if queue.is_empty() {
+                        let next = defaults.pop_front().unwrap();
+                        let source = if next.starts_with("http") {
+                            Restartable::ytdl(next, true).await
+                        } else {
+                            Restartable::ytdl_search(next, true).await
+                        };
+                        match source {
+                            Ok(source) => {
+                                handler.enqueue_source(source.into());
+                            },
+                            Err(why) => {
+                                tracing::error!("Err starting source: {:?}", why);
+                                return None;
+                            },
+                        };
+                    }
+                }
+            }
+        }
+
+        None
+    }
 }
