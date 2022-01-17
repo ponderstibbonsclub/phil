@@ -1,9 +1,19 @@
 //! Phil Collins - the simple Discord bot for the Ponder Stibbons Club
 //!
 //! Modified from Songbird voice_events_queue example
-use std::{collections::HashSet, env, time::Duration};
+use std::{
+    collections::HashSet,
+    env,
+    fs::File,
+    io::{BufReader, BufWriter},
+    path::Path,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Context;
+use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
 use serenity::{
     async_trait,
     builder::CreateMessage,
@@ -21,17 +31,24 @@ use serenity::{
         channel::Message,
         gateway::Ready,
         guild::Member,
-        id::{ChannelId, UserId},
+        id::{ChannelId, GuildId, UserId},
+        interactions::{
+            message_component::ButtonStyle, Interaction,
+            InteractionApplicationCommandCallbackDataFlags, InteractionResponseType,
+        },
         misc::Mentionable,
     },
+    prelude::TypeMapKey,
     utils::Colour,
     Result as SerenityResult,
 };
-
 use songbird::{
-    input::{restartable::Restartable, Metadata},
-    Event, EventContext, EventHandler as SongbirdEventHandler, SerenityInit, TrackEvent,
+    input::{restartable::Restartable, Input, Metadata},
+    tracks::{self, Track, TrackQueue},
+    Call, Event, EventContext, EventHandler as SongbirdEventHandler, SerenityInit, TrackEvent,
 };
+use time::{Date, OffsetDateTime};
+use tokio::sync::Mutex;
 
 struct Handler;
 
@@ -39,6 +56,57 @@ struct Handler;
 impl EventHandler for Handler {
     async fn ready(&self, _: DiscordContext, ready: Ready) {
         tracing::info!("{} is connected!", ready.user.name);
+    }
+
+    async fn interaction_create(&self, ctx: DiscordContext, interaction: Interaction) {
+        match interaction {
+            Interaction::MessageComponent(mut m) => {
+                let ident = m.data.custom_id.clone();
+                let blame = m.user.id;
+                let content;
+                let mut data = ctx.data.write().await;
+                if let Some(fallback_tracks) = data.get_mut::<FallbackTracksKey>() {
+                    fallback_tracks.add_track(ident, blame).await;
+                    if let Err(e) = fallback_tracks.write_file("fallback.json") {
+                        tracing::warn!("Error writing fallback!\n{e}");
+                    };
+                    content = "Added";
+                } else {
+                    content = "No fallback list exists"
+                };
+
+                check_msg(
+                    m.create_interaction_response(&ctx.http, |r| {
+                        r.kind(InteractionResponseType::ChannelMessageWithSource)
+                            .interaction_response_data(|d| {
+                                d.content(content).flags(
+                                    InteractionApplicationCommandCallbackDataFlags::EPHEMERAL,
+                                )
+                            })
+                    })
+                    .await,
+                );
+                if let Err(e) = m
+                    .message
+                    .edit(&ctx.http, |m| {
+                        m.components(|c| {
+                            c.create_action_row(|r| {
+                                r.create_button(|b| {
+                                    b.label("Confirm")
+                                        .style(ButtonStyle::Success)
+                                        .disabled(true)
+                                        .custom_id("null")
+                                })
+                            })
+                        })
+                    })
+                    .await
+                {
+                    tracing::warn!("Error editing interaction source: {}\n{}", m.message.id, e);
+                };
+            }
+            _ => tracing::warn!("Unexpected interaction received {:?}", interaction),
+        }
     }
 }
 
@@ -64,35 +132,159 @@ impl SongbirdEventHandler for TrackStartNotifier {
                     })
                     .await,
             );
-            // self.ctx
-            //     .set_presence(
-            //         Some(Activity::playing(
-            //             meta.title.unwrap_or_else(|| "untitled".to_string()),
-            //         )),
-            //         OnlineStatus::Online,
-            //     )
-            //     .await;
         }
 
         None
     }
 }
 
-// struct TrackPauseNotifier {
-//     ctx: DiscordContext,
-// }
+#[derive(Debug, Serialize, Deserialize)]
+struct FallbackTrack {
+    ident: String,
+    blame: UserId,
+    added: Date,
+}
 
-// #[async_trait]
-// impl SongbirdEventHandler for TrackPauseNotifier {
-//     async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
-//         self.ctx.set_presence(None, OnlineStatus::Idle).await;
-//         None
-//     }
-// }
+impl PartialEq for FallbackTrack {
+    fn eq(&self, other: &Self) -> bool {
+        self.ident == other.ident
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+struct FallbackTracks {
+    tracks: Vec<FallbackTrack>,
+}
+
+impl FallbackTracks {
+    async fn next_track(&self) -> Option<(Track, UserId)> {
+        let track_desc = {
+            let mut rng = rand::thread_rng();
+            self.tracks.choose(&mut rng)?
+        };
+
+        let source = match Restartable::ytdl(track_desc.ident.clone(), true).await {
+            Ok(source) => source,
+            Err(_) => {
+                tracing::error!("Err sourcing {}", track_desc.ident);
+                return None;
+            }
+        };
+
+        let (track, _) = tracks::create_player(source.into());
+
+        Some((track, track_desc.blame))
+    }
+
+    async fn add_track(&mut self, ident: String, blame: UserId) {
+        let added: Date = OffsetDateTime::from_unix_timestamp(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("hopefully this doesn't go back...")
+                .as_secs() as i64,
+        )
+        .expect("now is a valid time")
+        .date();
+
+        let track = FallbackTrack {
+            ident,
+            blame,
+            added,
+        };
+
+        if !self.tracks.contains(&track) {
+            self.tracks.push(track);
+        }
+    }
+
+    fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let reader = BufReader::new(File::open(path).context("Opening tracks file")?);
+        let tracks: FallbackTracks = serde_json::from_reader(reader)?;
+
+        Ok(tracks)
+    }
+
+    fn write_file(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        let path = path.as_ref();
+        let writer = BufWriter::new(File::create(path)?);
+        serde_json::to_writer(writer, self)?;
+        Ok(())
+    }
+}
+
+struct FallbackTracksKey;
+
+impl TypeMapKey for FallbackTracksKey {
+    type Value = FallbackTracks;
+}
+
+#[derive(Clone)]
+struct FallbackTracksHandler {
+    queue: TrackQueue,
+    driver: Arc<Mutex<Call>>,
+    ctx: DiscordContext,
+    channel_id: ChannelId,
+    guild_id: GuildId,
+}
+
+#[async_trait]
+impl SongbirdEventHandler for FallbackTracksHandler {
+    async fn act(&self, _evt_ctx: &EventContext<'_>) -> Option<Event> {
+        if !self.queue.is_empty() {
+            return None;
+        }
+
+        tracing::info!("Queue is empty, pulling from fallback queue");
+
+        let (track, blame_uid) = {
+            let data = self.ctx.data.read().await;
+            data.get::<FallbackTracksKey>()?.next_track().await?
+        };
+
+        let member = {
+            if let Some(guild) = self.ctx.cache.guild(self.guild_id) {
+                guild.member(&self.ctx, blame_uid).await.ok()
+            } else {
+                None
+            }
+        };
+        let blame = member.as_ref().map(QueueSource::Fallback);
+        let meta = track.handle.metadata().clone();
+
+        self.driver.lock().await.enqueue(track);
+
+        check_msg(
+            self.channel_id
+                .send_message(&self.ctx.http, |m| {
+                    track_embed(m, &meta, QueuePos::Now, blame);
+                    m
+                })
+                .await,
+        );
+
+        None
+    }
+}
 
 #[group]
 #[commands(
-    join, leave, mute, pause, play, playi, plays, queue, remove, resume, skip, stop, unmute, volume
+    join,
+    leave,
+    add_fallback,
+    mute,
+    pause,
+    play,
+    playi,
+    plays,
+    queue,
+    remove,
+    resume,
+    skip,
+    stop,
+    unmute,
+    volume
 )]
 struct General;
 
@@ -117,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
 
     let token = env::var("DISCORD_TOKEN").context("DISCORD_TOKEN environment variable not set")?;
 
-    let (owners, bot_id) = {
+    let (owners, app_id, bot_id) = {
         let mut owners = HashSet::new();
         let http = Http::new_with_token(&token);
         let info = http
@@ -137,7 +329,7 @@ async fn main() -> anyhow::Result<()> {
             .context("Could not access current user info")?
             .id;
 
-        (owners, bot_id)
+        (owners, info.id, bot_id)
     };
 
     let framework = StandardFramework::new()
@@ -151,10 +343,18 @@ async fn main() -> anyhow::Result<()> {
 
     let mut client = Client::builder(&token)
         .event_handler(Handler)
+        .application_id(app_id.0)
         .framework(framework)
         .register_songbird()
         .await
         .context("Client builder error")?;
+
+    let fallback_tracks = FallbackTracks::from_file("fallback.json").context("reading fallback")?;
+
+    {
+        let mut data = client.data.write().await;
+        data.insert::<FallbackTracksKey>(fallback_tracks);
+    }
 
     client
         .start()
@@ -169,7 +369,7 @@ async fn main() -> anyhow::Result<()> {
 #[aliases("j")]
 #[description("Instruct the bot to join the voice channel you are currently connected to.")]
 async fn join(ctx: &DiscordContext, msg: &Message) -> CommandResult {
-    let guild = msg.guild(&ctx.cache).await.unwrap();
+    let guild = msg.guild(&ctx.cache).unwrap();
     let guild_id = guild.id;
 
     let channel_id = guild
@@ -209,10 +409,16 @@ async fn join(ctx: &DiscordContext, msg: &Message) -> CommandResult {
                 ctx: ctx.clone(),
             },
         );
-        // handle.add_global_event(
-        //     Event::Track(TrackEvent::Pause),
-        //     TrackPauseNotifier { ctx: ctx.clone() },
-        // )
+        let queue = handle.queue().clone();
+        let fallback_handler = FallbackTracksHandler {
+            queue,
+            driver: Arc::clone(&handle_lock),
+            ctx: ctx.clone(),
+            channel_id: msg.channel_id,
+            guild_id: msg.guild_id.expect("Command only allowed in guilds"),
+        };
+        handle.add_global_event(Event::Track(TrackEvent::End), fallback_handler.clone());
+        handle.add_global_event(Event::Delayed(Duration::from_secs(30)), fallback_handler);
     } else {
         check_msg(
             msg.channel_id
@@ -250,6 +456,63 @@ async fn leave(ctx: &DiscordContext, msg: &Message) -> CommandResult {
     } else {
         check_msg(msg.reply(ctx, "Not in a voice channel").await);
     }
+
+    Ok(())
+}
+
+#[command]
+#[only_in(guilds)]
+#[aliases("a")]
+#[description("Add a track to the fallback list")]
+async fn add_fallback(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult {
+    let query = match args.remains() {
+        Some(q) => q.to_string(),
+        None => {
+            check_msg(
+                msg.channel_id
+                    .say(&ctx.http, "You forgot to specify what to add...")
+                    .await,
+            );
+
+            return Ok(());
+        }
+    };
+
+    let meta = match Restartable::ytdl_search(query, true).await {
+        Ok(s) => {
+            let input: Input = s.into();
+            input.metadata
+        }
+        Err(why) => {
+            tracing::error!("Err starting source: {:?}", why);
+
+            check_msg(
+                msg.channel_id
+                    .say(&ctx.http, format!("Something went wrong!\n{}", why))
+                    .await,
+            );
+
+            return Ok(());
+        }
+    };
+
+    check_msg(
+        msg.channel_id
+            .send_message(&ctx.http, |m| {
+                m.reference_message(msg);
+                track_embed(m, &meta, QueuePos::Fallback, None);
+                m.components(|c| {
+                    c.create_action_row(|r| {
+                        r.create_button(|b| {
+                            b.label("Confirm")
+                                .style(ButtonStyle::Success)
+                                .custom_id(meta.id.expect("YouTube should always provide ID"))
+                        })
+                    })
+                })
+            })
+            .await,
+    );
 
     Ok(())
 }
@@ -353,8 +616,6 @@ async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult 
         .clone();
 
     if let Some(handler_lock) = manager.get(guild_id) {
-        let mut handler = handler_lock.lock().await;
-
         let source = if query.starts_with("http") {
             Restartable::ytdl(query, true).await
         } else {
@@ -375,18 +636,13 @@ async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult 
             }
         };
 
-        handler.enqueue_source(source.into());
-        let (track, length) = {
-            let queue = handler.queue();
-            (
-                queue
-                    .current_queue()
-                    .last()
-                    .expect("Just queued something, there better be a last...")
-                    .metadata()
-                    .clone(),
-                queue.len(),
-            )
+        let (track, handle) = tracks::create_player(source.into());
+        let meta = handle.metadata();
+
+        let length = {
+            let mut handler = handler_lock.lock().await;
+            handler.enqueue(track);
+            handler.queue().len()
         };
 
         let pos = match length {
@@ -404,7 +660,7 @@ async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult 
         check_msg(
             msg.channel_id
                 .send_message(&ctx.http, |m| {
-                    track_embed(m, &track, pos, Some(blame));
+                    track_embed(m, meta, pos, Some(QueueSource::Manual(&blame)));
                     m
                 })
                 .await,
@@ -446,8 +702,6 @@ async fn playi(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
         .clone();
 
     if let Some(handler_lock) = manager.get(guild_id) {
-        let mut handler = handler_lock.lock().await;
-
         let source = if query.starts_with("http") {
             Restartable::ytdl(query, true).await
         } else {
@@ -468,15 +722,20 @@ async fn playi(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
             }
         };
 
-        handler.enqueue_source(source.into());
-        let queue = handler.queue();
-        if queue.len() > 1 {
-            let queue_vec = queue.current_queue();
-            let cur_first = queue_vec.first().expect("len > 1");
-            let _ = cur_first.pause();
-            let _ = cur_first.seek_time(Duration::ZERO);
-            queue.modify_queue(|q| q.rotate_right(1));
-            let _ = queue.current().expect("len > 1").play();
+        let (track, _) = tracks::create_player(source.into());
+
+        {
+            let mut handler = handler_lock.lock().await;
+            handler.enqueue(track);
+            let queue = handler.queue();
+            if queue.len() > 1 {
+                let queue_vec = queue.current_queue();
+                let cur_first = queue_vec.first().expect("len > 1");
+                let _ = cur_first.pause();
+                let _ = cur_first.seek_time(Duration::ZERO);
+                queue.modify_queue(|q| q.rotate_right(1));
+                let _ = queue.current().expect("len > 1").play();
+            }
         }
     } else {
         check_msg(
@@ -515,8 +774,6 @@ async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
         .clone();
 
     if let Some(handler_lock) = manager.get(guild_id) {
-        let mut handler = handler_lock.lock().await;
-
         let source = if query.starts_with("http") {
             Restartable::ytdl(query, true).await
         } else {
@@ -537,27 +794,25 @@ async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
             }
         };
 
-        handler.enqueue_source(source.into());
-        let queue = handler.queue();
+        let (track, handle) = tracks::create_player(source.into());
+        let meta = handle.metadata();
 
-        let (track, length) = {
-            (
-                queue
-                    .current_queue()
-                    .last()
-                    .expect("Just queued something, it should be there")
-                    .metadata()
-                    .clone(),
-                queue.len(),
-            )
+        let length = {
+            let mut handler = handler_lock.lock().await;
+            handler.enqueue(track);
+            let queue = handler.queue();
+
+            let length = queue.len();
+
+            if length > 1 {
+                queue.modify_queue(|q| {
+                    let t = q.pop_back().unwrap();
+                    q.insert(1, t);
+                });
+            }
+
+            length
         };
-
-        if queue.len() > 1 {
-            queue.modify_queue(|q| {
-                let t = q.pop_back().unwrap();
-                q.insert(1, t);
-            });
-        }
 
         let pos = match length {
             1 => QueuePos::Now,
@@ -572,7 +827,7 @@ async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
         check_msg(
             msg.channel_id
                 .send_message(&ctx.http, |m| {
-                    track_embed(m, &track, pos, Some(blame));
+                    track_embed(m, meta, pos, Some(QueueSource::Manual(&blame)));
                     m
                 })
                 .await,
@@ -605,8 +860,10 @@ async fn queue(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
         .clone();
 
     if let Some(handler_lock) = manager.get(guild_id) {
-        let handler = handler_lock.lock().await;
-        let queue = handler.queue().current_queue();
+        let queue = {
+            let handler = handler_lock.lock().await;
+            handler.queue().current_queue()
+        };
 
         check_msg(
             msg.channel_id
@@ -648,6 +905,17 @@ async fn queue(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
 #[description("Remove a track from the queue, identified by index")]
 async fn remove(ctx: &DiscordContext, msg: &Message, mut args: Args) -> CommandResult {
     let position = match args.single::<usize>() {
+        Ok(0 | 1) => {
+            check_msg(
+                msg.channel_id
+                    .say(
+                        &ctx.http,
+                        "Can't remove the currently playing track, use skip",
+                    )
+                    .await,
+            );
+            return Ok(());
+        }
         Ok(p) => p,
         Err(_) => {
             check_msg(
@@ -888,7 +1156,7 @@ async fn volume(ctx: &DiscordContext, msg: &Message, mut args: Args) -> CommandR
 }
 
 /// Checks that a message successfully sent; if not, then logs why using tracing.
-fn check_msg(result: SerenityResult<Message>) {
+fn check_msg<T>(result: SerenityResult<T>) {
     if let Err(why) = result {
         tracing::error!("Error sending message: {:?}", why);
     }
@@ -898,13 +1166,20 @@ enum QueuePos {
     Now,
     Next,
     Later(usize),
+    Fallback,
 }
 
+enum QueueSource<'a> {
+    Manual(&'a Member),
+    Fallback(&'a Member),
+}
+
+/// Create an embed for describing a track
 fn track_embed(
     message: &mut CreateMessage<'_>,
     meta: &Metadata,
     pos: QueuePos,
-    blame: Option<Member>,
+    blame: Option<QueueSource>,
 ) {
     message.embed(|e| {
         match pos {
@@ -919,6 +1194,10 @@ fn track_embed(
             QueuePos::Later(pos) => {
                 e.title(format!("Queued at {}", pos));
                 e.colour(Colour::GOLD);
+            }
+            QueuePos::Fallback => {
+                e.title("Add as fallback?");
+                e.colour(Colour::LIGHT_GREY);
             }
         };
 
@@ -937,9 +1216,17 @@ fn track_embed(
         if let Some(url) = &meta.thumbnail {
             e.thumbnail(url);
         }
-        if let Some(blame) = blame {
-            e.footer(|f| f.text(format!("Queued by {}", blame.display_name())));
+        match blame {
+            Some(QueueSource::Manual(blame)) => {
+                e.footer(|f| f.text(format!("Queued by {}", blame.display_name())))
+            }
+            Some(QueueSource::Fallback(blame)) => e.footer(|f| {
+                f.text(format!(
+                    "From the archives, courtesy of {}",
+                    blame.display_name()
+                ))
+            }),
+            None => e,
         }
-        e
     });
 }
