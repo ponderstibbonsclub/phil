@@ -151,7 +151,7 @@ impl PartialEq for FallbackTrack {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 struct FallbackTracks {
     tracks: Vec<FallbackTrack>,
@@ -349,7 +349,13 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Client builder error")?;
 
-    let fallback_tracks = FallbackTracks::from_file("fallback.json").context("reading fallback")?;
+    let fallback_tracks = match FallbackTracks::from_file("fallback.json") {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("Unable to open fallback file (this is normal on first run!)\n{e}");
+            FallbackTracks::default()
+        }
+    };
 
     {
         let mut data = client.data.write().await;
