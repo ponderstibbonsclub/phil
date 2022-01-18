@@ -64,16 +64,19 @@ impl EventHandler for Handler {
                 let ident = m.data.custom_id.clone();
                 let blame = m.user.id;
                 let content;
-                let mut data = ctx.data.write().await;
-                if let Some(fallback_tracks) = data.get_mut::<FallbackTracksKey>() {
-                    fallback_tracks.add_track(ident, blame).await;
-                    if let Err(e) = fallback_tracks.write_file("fallback.json") {
-                        tracing::warn!("Error writing fallback!\n{e}");
+
+                {
+                    let mut data = ctx.data.write().await;
+                    if let Some(fallback_tracks) = data.get_mut::<FallbackTracksKey>() {
+                        fallback_tracks.add_track(ident, blame).await;
+                        if let Err(e) = fallback_tracks.write_file("fallback.json") {
+                            tracing::warn!("Error writing fallback!\n{e}");
+                        };
+                        content = "Added";
+                    } else {
+                        content = "No fallback list exists"
                     };
-                    content = "Added";
-                } else {
-                    content = "No fallback list exists"
-                };
+                }
 
                 check_msg(
                     m.create_interaction_response(&ctx.http, |r| {
