@@ -5,6 +5,7 @@ use std::{
     collections::HashSet,
     env,
     fs::File,
+    hash::Hash,
     io::{BufReader, BufWriter},
     path::Path,
     sync::Arc,
@@ -12,7 +13,7 @@ use std::{
 };
 
 use anyhow::Context;
-use rand::seq::SliceRandom;
+use rand::seq::IteratorRandom;
 use serde::{Deserialize, Serialize};
 use serenity::{
     async_trait,
@@ -68,11 +69,14 @@ impl EventHandler for Handler {
                 {
                     let mut data = ctx.data.write().await;
                     if let Some(fallback_tracks) = data.get_mut::<FallbackTracksKey>() {
-                        fallback_tracks.add_track(ident, blame).await;
-                        if let Err(e) = fallback_tracks.write_file("fallback.json") {
-                            tracing::warn!("Error writing fallback!\n{e}");
-                        };
-                        content = "Added";
+                        if fallback_tracks.add_track(ident, blame).await {
+                            if let Err(e) = fallback_tracks.write_file("fallback.json") {
+                                tracing::warn!("Error writing fallback!\n{e}");
+                            };
+                            content = "Added!";
+                        } else {
+                            content = "This track is already in the archives"
+                        }
                     } else {
                         content = "No fallback list exists"
                     };
@@ -154,20 +158,33 @@ impl PartialEq for FallbackTrack {
     }
 }
 
+impl Eq for FallbackTrack {}
+
+impl Hash for FallbackTrack {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.ident.hash(state);
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 struct FallbackTracks {
-    tracks: Vec<FallbackTrack>,
+    tracks: HashSet<FallbackTrack>,
 }
 
 impl FallbackTracks {
     async fn next_track(&self) -> Option<(Track, UserId)> {
         let track_desc = {
             let mut rng = rand::thread_rng();
-            self.tracks.choose(&mut rng)?
+            self.tracks.iter().choose(&mut rng)?
         };
 
-        let source = match Restartable::ytdl(track_desc.ident.clone(), true).await {
+        let source = match Restartable::ytdl(
+            format!("https://youtube.com/watch?v={}", track_desc.ident), // Form URL as "-" is a valid character in YouTube URLs - if it appears at the start then the entire thing looks like a flag
+            true,
+        )
+        .await
+        {
             Ok(source) => source,
             Err(_) => {
                 tracing::error!("Err sourcing {}", track_desc.ident);
@@ -180,7 +197,7 @@ impl FallbackTracks {
         Some((track, track_desc.blame))
     }
 
-    async fn add_track(&mut self, ident: String, blame: UserId) {
+    async fn add_track(&mut self, ident: String, blame: UserId) -> bool {
         let added: Date = OffsetDateTime::from_unix_timestamp(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -196,9 +213,7 @@ impl FallbackTracks {
             added,
         };
 
-        if !self.tracks.contains(&track) {
-            self.tracks.push(track);
-        }
+        self.tracks.insert(track)
     }
 
     fn from_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -470,7 +485,7 @@ async fn leave(ctx: &DiscordContext, msg: &Message) -> CommandResult {
 }
 
 #[command]
-#[only_in(guilds)]
+#[owners_only]
 #[aliases("a")]
 #[description("Add a track to the fallback list")]
 async fn add_fallback(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult {
@@ -1030,7 +1045,7 @@ async fn skip(ctx: &DiscordContext, msg: &Message, _args: Args) -> CommandResult
             msg.channel_id
                 .say(
                     &ctx.http,
-                    format!("Song skipped: {} in queue.", queue.len()),
+                    format!("Song skipped: {} in queue.", queue.len() - 1),
                 )
                 .await,
         );
