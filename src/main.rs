@@ -29,17 +29,17 @@ use serenity::{
     },
     http::Http,
     model::{
+        application::{
+            component::ButtonStyle,
+            interaction::{Interaction, InteractionResponseType, MessageFlags},
+        },
         channel::Message,
         gateway::Ready,
         guild::Member,
         id::{ChannelId, GuildId, UserId},
-        interactions::{
-            message_component::ButtonStyle, Interaction,
-            InteractionApplicationCommandCallbackDataFlags, InteractionResponseType,
-        },
-        misc::Mentionable,
+        prelude::Mentionable,
     },
-    prelude::TypeMapKey,
+    prelude::{GatewayIntents, TypeMapKey},
     utils::Colour,
     Result as SerenityResult,
 };
@@ -86,9 +86,7 @@ impl EventHandler for Handler {
                     m.create_interaction_response(&ctx.http, |r| {
                         r.kind(InteractionResponseType::ChannelMessageWithSource)
                             .interaction_response_data(|d| {
-                                d.content(content).flags(
-                                    InteractionApplicationCommandCallbackDataFlags::EPHEMERAL,
-                                )
+                                d.content(content).flags(MessageFlags::EPHEMERAL)
                             })
                     })
                     .await,
@@ -261,14 +259,14 @@ impl SongbirdEventHandler for FallbackTracksHandler {
             data.get::<FallbackTracksKey>()?.next_track().await?
         };
 
-        let member = {
-            if let Some(guild) = self.ctx.cache.guild(self.guild_id) {
-                guild.member(&self.ctx, blame_uid).await.ok()
+        let blame = {
+            let guild_ref = self.ctx.cache.guild(self.guild_id).map(|gr| gr.clone());
+            if let Some(guild) = guild_ref {
+                guild.member(&self.ctx, blame_uid).await.ok().map(|mr| QueueSource::Fallback((*mr).clone()))
             } else {
                 None
             }
         };
-        let blame = member.as_ref().map(QueueSource::Fallback);
         let meta = track.handle.metadata().clone();
 
         self.driver.lock().await.enqueue(track);
@@ -329,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
 
     let (owners, app_id, bot_id) = {
         let mut owners = HashSet::new();
-        let http = Http::new_with_token(&token);
+        let http = Http::new(&token);
         let info = http
             .get_current_application_info()
             .await
@@ -359,7 +357,14 @@ async fn main() -> anyhow::Result<()> {
         .help(&HELP)
         .group(&GENERAL_GROUP);
 
-    let mut client = Client::builder(&token)
+    let intents = GatewayIntents::DIRECT_MESSAGES
+        | GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_INTEGRATIONS
+        | GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::GUILD_VOICE_STATES
+        | GatewayIntents::MESSAGE_CONTENT;
+
+    let mut client = Client::builder(&token, intents)
         .event_handler(Handler)
         .application_id(app_id.0)
         .framework(framework)
@@ -393,7 +398,7 @@ async fn main() -> anyhow::Result<()> {
 #[aliases("j")]
 #[description("Instruct the bot to join the voice channel you are currently connected to.")]
 async fn join(ctx: &DiscordContext, msg: &Message) -> CommandResult {
-    let guild = msg.guild(&ctx.cache).unwrap();
+    let guild = msg.guild(&ctx.cache).map(|gr| gr.clone()).unwrap();
     let guild_id = guild.id;
 
     let channel_id = guild
@@ -684,7 +689,12 @@ async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult 
         check_msg(
             msg.channel_id
                 .send_message(&ctx.http, |m| {
-                    track_embed(m, meta, pos, Some(QueueSource::Manual(&blame)));
+                    track_embed(
+                        m,
+                        meta,
+                        pos,
+                        Some(QueueSource::Manual(blame)),
+                    );
                     m
                 })
                 .await,
@@ -851,7 +861,12 @@ async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
         check_msg(
             msg.channel_id
                 .send_message(&ctx.http, |m| {
-                    track_embed(m, meta, pos, Some(QueueSource::Manual(&blame)));
+                    track_embed(
+                        m,
+                        meta,
+                        pos,
+                        Some(QueueSource::Manual(blame)),
+                    );
                     m
                 })
                 .await,
@@ -1193,9 +1208,9 @@ enum QueuePos {
     Fallback,
 }
 
-enum QueueSource<'a> {
-    Manual(&'a Member),
-    Fallback(&'a Member),
+enum QueueSource {
+    Manual(Member),
+    Fallback(Member),
 }
 
 /// Create an embed for describing a track
