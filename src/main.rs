@@ -262,7 +262,11 @@ impl SongbirdEventHandler for FallbackTracksHandler {
         let blame = {
             let guild_ref = self.ctx.cache.guild(self.guild_id).map(|gr| gr.clone());
             if let Some(guild) = guild_ref {
-                guild.member(&self.ctx, blame_uid).await.ok().map(|mr| QueueSource::Fallback((*mr).clone()))
+                guild
+                    .member(&self.ctx, blame_uid)
+                    .await
+                    .ok()
+                    .map(|mr| QueueSource::Fallback((*mr).clone()))
             } else {
                 None
             }
@@ -366,7 +370,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut client = Client::builder(&token, intents)
         .event_handler(Handler)
-        .application_id(app_id.0)
+        .application_id(app_id.0.into())
         .framework(framework)
         .register_songbird()
         .await
@@ -689,12 +693,7 @@ async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult 
         check_msg(
             msg.channel_id
                 .send_message(&ctx.http, |m| {
-                    track_embed(
-                        m,
-                        meta,
-                        pos,
-                        Some(QueueSource::Manual(blame)),
-                    );
+                    track_embed(m, meta, pos, Some(QueueSource::Manual(blame)));
                     m
                 })
                 .await,
@@ -861,12 +860,7 @@ async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
         check_msg(
             msg.channel_id
                 .send_message(&ctx.http, |m| {
-                    track_embed(
-                        m,
-                        meta,
-                        pos,
-                        Some(QueueSource::Manual(blame)),
-                    );
+                    track_embed(m, meta, pos, Some(QueueSource::Manual(blame)));
                     m
                 })
                 .await,
