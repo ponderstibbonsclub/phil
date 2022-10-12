@@ -17,7 +17,10 @@ use rand::seq::IteratorRandom;
 use serde::{Deserialize, Serialize};
 use serenity::{
     async_trait,
-    builder::CreateMessage,
+    builder::{
+        CreateActionRow, CreateButton, CreateComponents, CreateEmbed, CreateEmbedFooter,
+        CreateInteractionResponse, CreateInteractionResponseData, CreateMessage, EditMessage,
+    },
     client::{Client, Context as DiscordContext, EventHandler},
     framework::{
         standard::{
@@ -31,16 +34,16 @@ use serenity::{
     model::{
         application::{
             component::ButtonStyle,
-            interaction::{Interaction, InteractionResponseType, MessageFlags},
+            interaction::{Interaction, InteractionResponseType},
         },
-        channel::Message,
+        channel::{Message, MessageFlags},
+        colour::Colour,
         gateway::Ready,
         guild::Member,
         id::{ChannelId, GuildId, UserId},
-        prelude::Mentionable,
+        mention::Mentionable,
     },
     prelude::{GatewayIntents, TypeMapKey},
-    utils::Colour,
     Result as SerenityResult,
 };
 use songbird::{
@@ -82,29 +85,28 @@ impl EventHandler for Handler {
                     };
                 }
 
-                check_msg(
-                    m.create_interaction_response(&ctx.http, |r| {
-                        r.kind(InteractionResponseType::ChannelMessageWithSource)
-                            .interaction_response_data(|d| {
-                                d.content(content).flags(MessageFlags::EPHEMERAL)
-                            })
-                    })
-                    .await,
-                );
+                let response = CreateInteractionResponse::new()
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(
+                        CreateInteractionResponseData::new()
+                            .content(content)
+                            .flags(MessageFlags::EPHEMERAL),
+                    );
+                check_msg(m.create_interaction_response(&ctx.http, response).await);
                 if let Err(e) = m
                     .message
-                    .edit(&ctx.http, |m| {
-                        m.components(|c| {
-                            c.create_action_row(|r| {
-                                r.create_button(|b| {
-                                    b.label("Confirm")
-                                        .style(ButtonStyle::Success)
-                                        .disabled(true)
-                                        .custom_id("null")
-                                })
-                            })
-                        })
-                    })
+                    .edit(
+                        &ctx,
+                        EditMessage::new().components(
+                            CreateComponents::new().add_action_row(
+                                CreateActionRow::new().add_button(
+                                    CreateButton::new(ButtonStyle::Success, "null")
+                                        .label("Confirm")
+                                        .disabled(true),
+                                ),
+                            ),
+                        ),
+                    )
                     .await
                 {
                     tracing::warn!("Error editing interaction source: {}\n{}", m.message.id, e);
@@ -131,10 +133,7 @@ impl SongbirdEventHandler for TrackStartNotifier {
                 .metadata();
             check_msg(
                 self.channel_id
-                    .send_message(&self.ctx.http, |m| {
-                        track_embed(m, meta, QueuePos::Now, None);
-                        m
-                    })
+                    .send_message(&self.ctx.http, track_embed(meta, QueuePos::Now, None))
                     .await,
             );
         }
@@ -256,7 +255,10 @@ impl SongbirdEventHandler for FallbackTracksHandler {
 
         let (track, blame_uid) = {
             let data = self.ctx.data.read().await;
-            data.get::<FallbackTracksKey>()?.next_track().await?
+            match data.get::<FallbackTracksKey>()?.next_track().await {
+                Some(t) => t,
+                None => return Some(Event::Delayed(Duration::from_secs(5))),
+            }
         };
 
         let blame = {
@@ -277,10 +279,7 @@ impl SongbirdEventHandler for FallbackTracksHandler {
 
         check_msg(
             self.channel_id
-                .send_message(&self.ctx.http, |m| {
-                    track_embed(m, &meta, QueuePos::Now, blame);
-                    m
-                })
+                .send_message(&self.ctx.http, track_embed(&meta, QueuePos::Now, blame))
                 .await,
         );
 
@@ -352,14 +351,12 @@ async fn main() -> anyhow::Result<()> {
         (owners, info.id, bot_id)
     };
 
-    let framework = StandardFramework::new()
-        .configure(|c| {
-            c.prefixes([".", "~"])
-                .owners(owners)
-                .on_mention(Some(bot_id))
-        })
-        .help(&HELP)
-        .group(&GENERAL_GROUP);
+    let framework = StandardFramework::new().help(&HELP).group(&GENERAL_GROUP);
+    framework.configure(|c| {
+        c.prefixes([".", "~"])
+            .owners(owners)
+            .on_mention(Some(bot_id))
+    });
 
     let intents = GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::GUILDS
@@ -531,18 +528,20 @@ async fn add_fallback(ctx: &DiscordContext, msg: &Message, args: Args) -> Comman
 
     check_msg(
         msg.channel_id
-            .send_message(&ctx.http, |m| {
-                m.reference_message(msg);
-                track_embed(m, &meta, QueuePos::Fallback, None);
-                m.components(|c| {
-                    c.create_action_row(|r| {
-                        r.create_button(|b| {
-                            b.label("Confirm")
-                                .style(ButtonStyle::Success)
-                                .custom_id(meta.id.expect("YouTube should always provide ID"))
-                        })
-                    })
-                })
+            .send_message(&ctx.http, {
+                track_embed(&meta, QueuePos::Fallback, None)
+                    .reference_message(msg)
+                    .components(
+                        CreateComponents::new().add_action_row(
+                            CreateActionRow::new().add_button(
+                                CreateButton::new(
+                                    ButtonStyle::Success,
+                                    meta.id.expect("YouTube should always provide ID"),
+                                )
+                                .label("Confirm"),
+                            ),
+                        ),
+                    )
             })
             .await,
     );
@@ -692,10 +691,10 @@ async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult 
 
         check_msg(
             msg.channel_id
-                .send_message(&ctx.http, |m| {
-                    track_embed(m, meta, pos, Some(QueueSource::Manual(blame)));
-                    m
-                })
+                .send_message(
+                    &ctx.http,
+                    track_embed(meta, pos, Some(QueueSource::Manual(blame))),
+                )
                 .await,
         );
     } else {
@@ -859,10 +858,10 @@ async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
 
         check_msg(
             msg.channel_id
-                .send_message(&ctx.http, |m| {
-                    track_embed(m, meta, pos, Some(QueueSource::Manual(blame)));
-                    m
-                })
+                .send_message(
+                    &ctx.http,
+                    track_embed(meta, pos, Some(QueueSource::Manual(blame))),
+                )
                 .await,
         );
     } else {
@@ -900,8 +899,10 @@ async fn queue(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
 
         check_msg(
             msg.channel_id
-                .send_message(&ctx.http, |m| {
-                    m.embed(|e| {
+                .send_message(
+                    &ctx.http,
+                    CreateMessage::new().embed({
+                        let e = CreateEmbed::new();
                         let desc = queue
                             .iter()
                             .enumerate()
@@ -917,8 +918,8 @@ async fn queue(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
                                 s
                             });
                         e.title("Current Queue").description(desc)
-                    })
-                })
+                    }),
+                )
                 .await,
         );
     } else {
@@ -1084,7 +1085,7 @@ async fn stop(ctx: &DiscordContext, msg: &Message, _args: Args) -> CommandResult
     if let Some(handler_lock) = manager.get(guild_id) {
         let handler = handler_lock.lock().await;
         let queue = handler.queue();
-        let _ = queue.stop();
+        queue.stop();
 
         check_msg(msg.channel_id.say(&ctx.http, "Queue cleared.").await);
     } else {
@@ -1208,58 +1209,42 @@ enum QueueSource {
 }
 
 /// Create an embed for describing a track
-fn track_embed(
-    message: &mut CreateMessage<'_>,
-    meta: &Metadata,
-    pos: QueuePos,
-    blame: Option<QueueSource>,
-) {
-    message.embed(|e| {
-        match pos {
-            QueuePos::Now => {
-                e.title("🎵 Now Playing 🎵");
-                e.colour(Colour::DARK_GREEN);
-            }
-            QueuePos::Next => {
-                e.title("Next Up");
-                e.colour(Colour::DARK_GREEN);
-            }
-            QueuePos::Later(pos) => {
-                e.title(format!("Queued at {}", pos));
-                e.colour(Colour::GOLD);
-            }
-            QueuePos::Fallback => {
-                e.title("Add as fallback?");
-                e.colour(Colour::LIGHT_GREY);
-            }
-        };
+fn track_embed(meta: &Metadata, pos: QueuePos, blame: Option<QueueSource>) -> CreateMessage {
+    let mut embed = CreateEmbed::new();
+    embed = match pos {
+        QueuePos::Now => embed.title("🎵 Now Playing 🎵").colour(Colour::DARK_GREEN),
+        QueuePos::Next => embed.title("Next Up").colour(Colour::DARK_GREEN),
+        QueuePos::Later(pos) => embed
+            .title(format!("Queued at {}", pos))
+            .colour(Colour::GOLD),
+        QueuePos::Fallback => embed.title("Add as fallback?").colour(Colour::LIGHT_GREY),
+    };
 
-        let mut desc = String::new();
-        if let Some(title) = &meta.title {
-            desc.push_str(title);
-        } else {
-            desc.push_str("untitled");
-        }
-        desc.push('\n');
-        if let Some(artist) = &meta.artist {
-            desc.push_str(&format!("By {}", artist));
-        }
-        e.description(desc);
+    let mut desc = String::new();
+    if let Some(title) = &meta.title {
+        desc.push_str(title);
+    } else {
+        desc.push_str("untitled");
+    }
+    desc.push('\n');
+    if let Some(artist) = &meta.artist {
+        desc.push_str(&format!("By {}", artist));
+    }
+    embed = embed.description(desc);
 
-        if let Some(url) = &meta.thumbnail {
-            e.thumbnail(url);
-        }
-        match blame {
-            Some(QueueSource::Manual(blame)) => {
-                e.footer(|f| f.text(format!("Queued by {}", blame.display_name())))
-            }
-            Some(QueueSource::Fallback(blame)) => e.footer(|f| {
-                f.text(format!(
-                    "From the archives, courtesy of {}",
-                    blame.display_name()
-                ))
-            }),
-            None => e,
-        }
-    });
+    if let Some(url) = &meta.thumbnail {
+        embed = embed.thumbnail(url);
+    }
+    embed = match blame {
+        Some(QueueSource::Manual(blame)) => embed.footer(CreateEmbedFooter::new(format!(
+            "Queued by {}",
+            blame.display_name()
+        ))),
+        Some(QueueSource::Fallback(blame)) => embed.footer(CreateEmbedFooter::new(format!(
+            "From the archives, courtesy of {}",
+            blame.display_name()
+        ))),
+        None => embed,
+    };
+    CreateMessage::new().add_embed(embed)
 }
