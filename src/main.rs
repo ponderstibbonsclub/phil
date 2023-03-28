@@ -13,7 +13,10 @@ use std::{
 };
 
 use anyhow::Context;
+use once_cell::sync::Lazy;
 use rand::seq::IteratorRandom;
+use regex::Regex;
+use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use serenity::{
     async_trait,
@@ -44,8 +47,8 @@ use serenity::{
     Result as SerenityResult,
 };
 use songbird::{
-    input::{restartable::Restartable, Input, Metadata},
-    tracks::{self, Track, TrackQueue},
+    input::{AuxMetadata, Compose, YoutubeDl},
+    tracks::{Track, TrackQueue},
     Call, Event, EventContext, EventHandler as SongbirdEventHandler, SerenityInit, TrackEvent,
 };
 use time::{Date, OffsetDateTime};
@@ -118,14 +121,23 @@ struct TrackStartNotifier {
 impl SongbirdEventHandler for TrackStartNotifier {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::Track(track_list) = ctx {
-            let meta = track_list
-                .first()
-                .expect("Something must be starting")
-                .1
-                .metadata();
+            let th = track_list.first().expect("Something must be starting").1;
+
+            let (meta, blame) = {
+                let tm = th.typemap().read().await;
+                let Some(meta) = tm.get::<MetadataKey>().cloned() else {
+                    return Some(Event::Delayed(Duration::from_secs(1)));
+                };
+                let blame = tm.get::<BlameKey>().cloned();
+                (meta, blame)
+            };
+
             check_msg(
                 self.channel_id
-                    .send_message(&self.ctx.http, track_embed(meta, QueuePos::Now, None))
+                    .send_message(
+                        &self.ctx.http,
+                        track_embed(&meta, QueuePos::Now, blame),
+                    )
                     .await,
             );
         }
@@ -162,28 +174,20 @@ struct FallbackTracks {
 }
 
 impl FallbackTracks {
-    async fn next_track(&self) -> Option<(Track, UserId)> {
+    async fn next_track(&self, ctx: &DiscordContext) -> Option<(Track, UserId)> {
         let track_desc = {
             let mut rng = rand::thread_rng();
             self.tracks.iter().choose(&mut rng)?
         };
 
-        let source = match Restartable::ytdl(
-            format!("https://youtube.com/watch?v={}", track_desc.ident), // Form URL as "-" is a valid character in YouTube URLs - if it appears at the start then the entire thing looks like a flag
-            true,
-        )
-        .await
-        {
-            Ok(source) => source,
-            Err(_) => {
-                tracing::error!("Err sourcing {}", track_desc.ident);
-                return None;
-            }
-        };
+        let client_http = http_from_context(ctx).await;
 
-        let (track, _) = tracks::create_player(source.into());
+        let source = YoutubeDl::new(
+            client_http,
+            format!("https://youtube.com/watch?v={}", track_desc.ident),
+        );
 
-        Some((track, track_desc.blame))
+        Some((Track::new(source.into()), track_desc.blame))
     }
 
     async fn add_track(&mut self, ident: String, blame: UserId) -> bool {
@@ -232,7 +236,6 @@ struct FallbackTracksHandler {
     queue: TrackQueue,
     driver: Arc<Mutex<Call>>,
     ctx: DiscordContext,
-    channel_id: ChannelId,
     guild_id: GuildId,
 }
 
@@ -245,9 +248,9 @@ impl SongbirdEventHandler for FallbackTracksHandler {
 
         tracing::info!("Queue is empty, pulling from fallback queue");
 
-        let (track, blame_uid) = {
+        let (mut track, blame_uid) = {
             let data = self.ctx.data.read().await;
-            match data.get::<FallbackTracksKey>()?.next_track().await {
+            match data.get::<FallbackTracksKey>()?.next_track(&self.ctx).await {
                 Some(t) => t,
                 None => return Some(Event::Delayed(Duration::from_secs(5))),
             }
@@ -260,23 +263,50 @@ impl SongbirdEventHandler for FallbackTracksHandler {
                     .member(&self.ctx, blame_uid)
                     .await
                     .ok()
-                    .map(|mr| QueueSource::Fallback((*mr).clone()))
+                    .map(|mr| Blame::Fallback((*mr).clone()))
             } else {
                 None
             }
         };
-        let meta = track.handle.metadata().clone();
 
-        self.driver.lock().await.enqueue(track);
+        let meta = track.input.aux_metadata().await.ok()?;
+        let track = self.driver.lock().await.enqueue(track).await;
 
-        check_msg(
-            self.channel_id
-                .send_message(&self.ctx.http, track_embed(&meta, QueuePos::Now, blame))
-                .await,
-        );
+        {
+            let mut tm = track.typemap().write().await;
+            tm.insert::<MetadataKey>(meta);
+            if let Some(blame) = blame {
+                tm.insert::<BlameKey>(blame);
+            }
+        }
 
         None
     }
+}
+
+struct HttpKey;
+
+impl TypeMapKey for HttpKey {
+    type Value = HttpClient;
+}
+
+async fn http_from_context(ctx: &DiscordContext) -> HttpClient {
+    let data = ctx.data.read().await;
+    data.get::<HttpKey>()
+        .cloned()
+        .expect("HTTP client should be initialised at runtime")
+}
+
+struct MetadataKey;
+
+impl TypeMapKey for MetadataKey {
+    type Value = AuxMetadata;
+}
+
+struct BlameKey;
+
+impl TypeMapKey for BlameKey {
+    type Value = Blame;
 }
 
 #[group]
@@ -362,6 +392,7 @@ async fn main() -> anyhow::Result<()> {
         .application_id(app_id.0.into())
         .framework(framework)
         .register_songbird()
+        .type_map_insert::<HttpKey>(HttpClient::new())
         .await
         .context("Client builder error")?;
 
@@ -413,9 +444,7 @@ async fn join(ctx: &DiscordContext, msg: &Message) -> CommandResult {
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
 
-    let (handle_lock, success) = manager.join(guild_id, connect_to).await;
-
-    if let Ok(_channel) = success {
+    if let Ok(handle_lock) = manager.join(guild_id, connect_to).await {
         check_msg(
             msg.channel_id
                 .say(&ctx.http, &format!("Joined {}", connect_to.mention()))
@@ -436,7 +465,6 @@ async fn join(ctx: &DiscordContext, msg: &Message) -> CommandResult {
             queue,
             driver: Arc::clone(&handle_lock),
             ctx: ctx.clone(),
-            channel_id: msg.channel_id,
             guild_id: msg.guild_id.expect("Command only allowed in guilds"),
         };
         handle.add_global_event(Event::Track(TrackEvent::End), fallback_handler.clone());
@@ -500,22 +528,34 @@ async fn add_fallback(ctx: &DiscordContext, msg: &Message, args: Args) -> Comman
         }
     };
 
-    let meta = match Restartable::ytdl_search(query, true).await {
-        Ok(s) => {
-            let input: Input = s.into();
-            input.metadata
-        }
-        Err(why) => {
-            tracing::error!("Err starting source: {:?}", why);
+    let http_client = http_from_context(ctx).await;
 
-            check_msg(
-                msg.channel_id
-                    .say(&ctx.http, format!("Something went wrong!\n{}", why))
-                    .await,
-            );
+    let mut source = if query.starts_with("http") {
+        YoutubeDl::new(http_client, query)
+    } else {
+        YoutubeDl::new(http_client, format!("ytsearch:{query}"))
+    };
 
-            return Ok(());
-        }
+    let Ok(mut meta) = source.aux_metadata().await else {
+        check_msg(msg.channel_id.say(&ctx, "Failed to get track meta").await);
+        return Ok(())
+    };
+
+    static YT_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^.*(?:(?:youtu\.be/|v/|vi/|u/\w/|embed/|shorts/)|(?:(?:watch)?\?v(?:i)?=|\&v(?:i)?=))([^#\&\?]*).*").expect("regex should be valid")
+    });
+
+    let url = meta
+        .source_url
+        .take()
+        .expect("YouTube tracks should have a URL");
+    let Some(caps) = YT_RE.captures(&url) else {
+        tracing::info!("Could not extract id from URL {:?}", url);
+        return Ok(());
+    };
+    let Some(id) = caps.get(1) else {
+        tracing::info!("No match in {caps:?}");
+        return Ok(())
     };
 
     check_msg(
@@ -524,7 +564,7 @@ async fn add_fallback(ctx: &DiscordContext, msg: &Message, args: Args) -> Comman
                 track_embed(&meta, QueuePos::Fallback, None)
                     .reference_message(msg)
                     .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
-                        meta.id.expect("YouTube should always provide ID"),
+                        id.as_str(),
                     )
                     .label("Confirm")
                     .style(ButtonStyle::Success)])])
@@ -628,39 +668,29 @@ async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult 
 
     let guild_id = msg.guild_id.expect("Command can only be used in guilds");
 
+    let http_client = http_from_context(ctx).await;
+
     let manager = songbird::get(ctx)
         .await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
 
     if let Some(handler_lock) = manager.get(guild_id) {
-        let source = if query.starts_with("http") {
-            Restartable::ytdl(query, true).await
+        let mut source = if query.starts_with("http") {
+            YoutubeDl::new(http_client, query)
         } else {
-            Restartable::ytdl_search(query, true).await
-        };
-        let source = match source {
-            Ok(source) => source,
-            Err(why) => {
-                tracing::error!("Err starting source: {:?}", why);
-
-                check_msg(
-                    msg.channel_id
-                        .say(&ctx.http, format!("Something went wrong!\n{}", why))
-                        .await,
-                );
-
-                return Ok(());
-            }
+            YoutubeDl::new(http_client, format!("ytsearch:{}", query))
         };
 
-        let (track, handle) = tracks::create_player(source.into());
-        let meta = handle.metadata();
+        let Ok(meta) = source.aux_metadata().await else {
+            check_msg(msg.channel_id.say(&ctx, "Failed to get track meta").await);
+            return Ok(());
+        };
 
-        let length = {
+        let (track, length) = {
             let mut handler = handler_lock.lock().await;
-            handler.enqueue(track);
-            handler.queue().len()
+            let track = handler.enqueue(Track::new(source.into())).await;
+            (track, handler.queue().len())
         };
 
         let pos = match length {
@@ -679,10 +709,16 @@ async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult 
             msg.channel_id
                 .send_message(
                     &ctx.http,
-                    track_embed(meta, pos, Some(QueueSource::Manual(blame))),
+                    track_embed(&meta, pos, Some(Blame::Manual(blame.clone()))),
                 )
                 .await,
         );
+
+        {
+            let mut tm = track.typemap().write().await;
+            tm.insert::<MetadataKey>(meta);
+            tm.insert::<BlameKey>(Blame::Manual(blame));
+        }
     } else {
         check_msg(
             msg.channel_id
@@ -714,43 +750,38 @@ async fn playi(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
 
     let guild_id = msg.guild_id.expect("Command can only be used in guilds");
 
+    let http_client = http_from_context(ctx).await;
+
     let manager = songbird::get(ctx)
         .await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
 
     if let Some(handler_lock) = manager.get(guild_id) {
-        let source = if query.starts_with("http") {
-            Restartable::ytdl(query, true).await
+        let mut source = if query.starts_with("http") {
+            YoutubeDl::new(http_client, query)
         } else {
-            Restartable::ytdl_search(query, true).await
-        };
-        let source = match source {
-            Ok(source) => source,
-            Err(why) => {
-                tracing::error!("Err starting source: {:?}", why);
-
-                check_msg(
-                    msg.channel_id
-                        .say(&ctx.http, format!("Something went wrong!\n{}", why))
-                        .await,
-                );
-
-                return Ok(());
-            }
+            YoutubeDl::new(http_client, format!("ytsearch:{}", query))
         };
 
-        let (track, _) = tracks::create_player(source.into());
+        let Ok(meta) = source.aux_metadata().await else {
+            check_msg(msg.channel_id.say(&ctx, "Failed to get track meta").await);
+            return Ok(());
+        };
 
         {
             let mut handler = handler_lock.lock().await;
-            handler.enqueue(track);
+            let track = handler.enqueue(Track::new(source.into())).await;
+            {
+                let mut tm = track.typemap().write().await;
+                tm.insert::<MetadataKey>(meta);
+            }
             let queue = handler.queue();
             if queue.len() > 1 {
                 let queue_vec = queue.current_queue();
                 let cur_first = queue_vec.first().expect("len > 1");
                 let _ = cur_first.pause();
-                let _ = cur_first.seek_time(Duration::ZERO);
+                let _ = cur_first.seek(Duration::ZERO);
                 queue.modify_queue(|q| q.rotate_right(1));
                 let _ = queue.current().expect("len > 1").play();
             }
@@ -786,38 +817,28 @@ async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
 
     let guild_id = msg.guild_id.expect("Command can only be used in guilds");
 
+    let http_client = http_from_context(ctx).await;
+
     let manager = songbird::get(ctx)
         .await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
 
     if let Some(handler_lock) = manager.get(guild_id) {
-        let source = if query.starts_with("http") {
-            Restartable::ytdl(query, true).await
+        let mut source = if query.starts_with("http") {
+            YoutubeDl::new(http_client, query)
         } else {
-            Restartable::ytdl_search(query, true).await
-        };
-        let source = match source {
-            Ok(source) => source,
-            Err(why) => {
-                tracing::error!("Err starting source: {:?}", why);
-
-                check_msg(
-                    msg.channel_id
-                        .say(&ctx.http, format!("Something went wrong!\n{}", why))
-                        .await,
-                );
-
-                return Ok(());
-            }
+            YoutubeDl::new(http_client, format!("ytsearch:{query}"))
         };
 
-        let (track, handle) = tracks::create_player(source.into());
-        let meta = handle.metadata();
+        let Ok(meta) = source.aux_metadata().await else {
+            check_msg(msg.channel_id.say(&ctx, "Failed to get track meta").await);
+            return Ok(());
+        };
 
-        let length = {
+        let (track, length) = {
             let mut handler = handler_lock.lock().await;
-            handler.enqueue(track);
+            let track = handler.enqueue(Track::new(source.into())).await;
             let queue = handler.queue();
 
             let length = queue.len();
@@ -829,7 +850,7 @@ async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
                 });
             }
 
-            length
+            (track, length)
         };
 
         let pos = match length {
@@ -846,10 +867,16 @@ async fn plays(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
             msg.channel_id
                 .send_message(
                     &ctx.http,
-                    track_embed(meta, pos, Some(QueueSource::Manual(blame))),
+                    track_embed(&meta, pos, Some(Blame::Manual(blame.clone()))),
                 )
                 .await,
         );
+
+        {
+            let mut tm = track.typemap().write().await;
+            tm.insert::<MetadataKey>(meta);
+            tm.insert::<BlameKey>(Blame::Manual(blame));
+        }
     } else {
         check_msg(
             msg.channel_id
@@ -889,16 +916,20 @@ async fn queue(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
                     &ctx.http,
                     CreateMessage::new().embed({
                         let e = CreateEmbed::new();
-                        let desc = queue
+                        let metas = futures::future::join_all(queue.iter().map(|t| async {
+                            let tm = t.typemap().read().await;
+                            tm.get::<MetadataKey>().cloned()
+                        }))
+                        .await;
+                        let desc = metas
                             .iter()
                             .enumerate()
-                            .fold(String::new(), |mut s, (p, t)| {
+                            .fold(String::new(), |mut s, (p, m)| {
                                 s.push_str(&format!(
                                     "{}: {}\n",
                                     p + 1,
-                                    t.metadata()
-                                        .title
-                                        .clone()
+                                    m.as_ref()
+                                        .and_then(|m| m.title.clone())
                                         .unwrap_or_else(|| "untitled".to_string())
                                 ));
                                 s
@@ -1189,13 +1220,14 @@ enum QueuePos {
     Fallback,
 }
 
-enum QueueSource {
+#[derive(Clone)]
+enum Blame {
     Manual(Member),
     Fallback(Member),
 }
 
 /// Create an embed for describing a track
-fn track_embed(meta: &Metadata, pos: QueuePos, blame: Option<QueueSource>) -> CreateMessage {
+fn track_embed(meta: &AuxMetadata, pos: QueuePos, blame: Option<Blame>) -> CreateMessage {
     let mut embed = CreateEmbed::new();
     embed = match pos {
         QueuePos::Now => embed.title("🎵 Now Playing 🎵").colour(Colour::DARK_GREEN),
@@ -1222,11 +1254,11 @@ fn track_embed(meta: &Metadata, pos: QueuePos, blame: Option<QueueSource>) -> Cr
         embed = embed.thumbnail(url);
     }
     embed = match blame {
-        Some(QueueSource::Manual(blame)) => embed.footer(CreateEmbedFooter::new(format!(
+        Some(Blame::Manual(blame)) => embed.footer(CreateEmbedFooter::new(format!(
             "Queued by {}",
             blame.display_name()
         ))),
-        Some(QueueSource::Fallback(blame)) => embed.footer(CreateEmbedFooter::new(format!(
+        Some(Blame::Fallback(blame)) => embed.footer(CreateEmbedFooter::new(format!(
             "From the archives, courtesy of {}",
             blame.display_name()
         ))),
