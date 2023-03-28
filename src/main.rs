@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use serenity::{
     async_trait,
     builder::{
-        CreateActionRow, CreateButton, CreateComponents, CreateEmbed, CreateEmbedFooter,
-        CreateInteractionResponse, CreateInteractionResponseData, CreateMessage, EditMessage,
+        CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter, CreateInteractionResponse,
+        CreateInteractionResponseMessage, CreateMessage, EditMessage,
     },
     client::{Client, Context as DiscordContext, EventHandler},
     framework::{
@@ -32,11 +32,8 @@ use serenity::{
     },
     http::Http,
     model::{
-        application::{
-            component::ButtonStyle,
-            interaction::{Interaction, InteractionResponseType},
-        },
-        channel::{Message, MessageFlags},
+        application::{ButtonStyle, Interaction},
+        channel::Message,
         colour::Colour,
         gateway::Ready,
         guild::Member,
@@ -64,9 +61,9 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: DiscordContext, interaction: Interaction) {
         match interaction {
-            Interaction::MessageComponent(mut m) => {
-                let ident = m.data.custom_id.clone();
-                let blame = m.user.id;
+            Interaction::Component(mut i) => {
+                let ident = i.data.custom_id.clone();
+                let blame = i.user.id;
                 let content;
 
                 {
@@ -85,31 +82,26 @@ impl EventHandler for Handler {
                     };
                 }
 
-                let response = CreateInteractionResponse::new()
-                    .kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(
-                        CreateInteractionResponseData::new()
-                            .content(content)
-                            .flags(MessageFlags::EPHEMERAL),
-                    );
-                check_msg(m.create_interaction_response(&ctx.http, response).await);
-                if let Err(e) = m
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(content)
+                        .ephemeral(true),
+                );
+                check_msg(i.create_response(&ctx.http, response).await);
+                if let Err(e) = i
                     .message
                     .edit(
                         &ctx,
-                        EditMessage::new().components(
-                            CreateComponents::new().add_action_row(
-                                CreateActionRow::new().add_button(
-                                    CreateButton::new(ButtonStyle::Success, "null")
-                                        .label("Confirm")
-                                        .disabled(true),
-                                ),
-                            ),
-                        ),
+                        EditMessage::new().components(vec![CreateActionRow::Buttons(vec![
+                            CreateButton::new("null")
+                                .label("Confirm")
+                                .style(ButtonStyle::Success)
+                                .disabled(true),
+                        ])]),
                     )
                     .await
                 {
-                    tracing::warn!("Error editing interaction source: {}\n{}", m.message.id, e);
+                    tracing::warn!("Error editing interaction source: {}\n{}", i.message.id, e);
                 };
             }
             _ => tracing::warn!("Unexpected interaction received {:?}", interaction),
@@ -531,17 +523,11 @@ async fn add_fallback(ctx: &DiscordContext, msg: &Message, args: Args) -> Comman
             .send_message(&ctx.http, {
                 track_embed(&meta, QueuePos::Fallback, None)
                     .reference_message(msg)
-                    .components(
-                        CreateComponents::new().add_action_row(
-                            CreateActionRow::new().add_button(
-                                CreateButton::new(
-                                    ButtonStyle::Success,
-                                    meta.id.expect("YouTube should always provide ID"),
-                                )
-                                .label("Confirm"),
-                            ),
-                        ),
+                    .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
+                        meta.id.expect("YouTube should always provide ID"),
                     )
+                    .label("Confirm")
+                    .style(ButtonStyle::Success)])])
             })
             .await,
     );
