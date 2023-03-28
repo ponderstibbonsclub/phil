@@ -134,10 +134,7 @@ impl SongbirdEventHandler for TrackStartNotifier {
 
             check_msg(
                 self.channel_id
-                    .send_message(
-                        &self.ctx.http,
-                        track_embed(&meta, QueuePos::Now, blame),
-                    )
+                    .send_message(&self.ctx.http, track_embed(&meta, QueuePos::Now, blame))
                     .await,
             );
         }
@@ -1066,8 +1063,13 @@ async fn skip(ctx: &DiscordContext, msg: &Message, _args: Args) -> CommandResult
     if let Some(handler_lock) = manager.get(guild_id) {
         let handler = handler_lock.lock().await;
         let queue = handler.queue();
-        let _ = queue.skip();
 
+        if queue.is_empty() {
+            check_msg(msg.channel_id.say(&ctx, format!("No songs in queue")).await);
+            return Ok(());
+        }
+
+        let _ = queue.skip();
         check_msg(
             msg.channel_id
                 .say(
