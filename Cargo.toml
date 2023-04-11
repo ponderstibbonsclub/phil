@@ -50,3 +50,6 @@ features = ["serde"]
 [dependencies.tokio]
 version = "1"
 features = ["macros", "rt-multi-thread", "sync"]
+
+[patch."https://github.com/serenity-rs/serenity"]
+serenity = { git = "https://github.com/sam-kirby/serenity.git", rev = "c628b15228ae1044d2a3e785a52b9cd8e8f52f21" }

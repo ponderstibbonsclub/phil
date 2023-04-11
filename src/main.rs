@@ -53,6 +53,7 @@ use songbird::{
 };
 use time::{Date, OffsetDateTime};
 use tokio::sync::Mutex;
+use tracing::error;
 
 struct Handler;
 
@@ -419,13 +420,14 @@ async fn main() -> anyhow::Result<()> {
 #[aliases("j")]
 #[description("Instruct the bot to join the voice channel you are currently connected to.")]
 async fn join(ctx: &DiscordContext, msg: &Message) -> CommandResult {
-    let guild = msg.guild(&ctx.cache).map(|gr| gr.clone()).unwrap();
-    let guild_id = guild.id;
-
-    let channel_id = guild
-        .voice_states
-        .get(&msg.author.id)
-        .and_then(|voice_state| voice_state.channel_id);
+    let (guild_id, channel_id) = {
+        let guild = msg.guild(&ctx.cache).unwrap();
+        let channel_id = guild
+            .voice_states
+            .get(&msg.author.id)
+            .and_then(|voice_state| voice_state.channel_id);
+        (guild.id, channel_id)
+    };
 
     let connect_to = match channel_id {
         Some(channel) => channel,
@@ -441,38 +443,42 @@ async fn join(ctx: &DiscordContext, msg: &Message) -> CommandResult {
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
 
-    if let Ok(handle_lock) = manager.join(guild_id, connect_to).await {
-        check_msg(
-            msg.channel_id
-                .say(&ctx.http, &format!("Joined {}", connect_to.mention()))
-                .await,
-        );
+    let handle_lock = match manager.join(guild_id, connect_to).await {
+        Ok(hl) => hl,
+        Err(e) => {
+            check_msg(
+                msg.channel_id
+                    .say(&ctx.http, "Error joining the channel")
+                    .await,
+            );
+            error!("Error joining a voice channel\n{e:?}");
+            return Ok(());
+        }
+    };
+    check_msg(
+        msg.channel_id
+            .say(&ctx.http, &format!("Joined {}", connect_to.mention()))
+            .await,
+    );
 
-        let mut handle = handle_lock.lock().await;
+    let mut handle = handle_lock.lock().await;
 
-        handle.add_global_event(
-            Event::Track(TrackEvent::Play),
-            TrackStartNotifier {
-                channel_id: msg.channel_id,
-                ctx: ctx.clone(),
-            },
-        );
-        let queue = handle.queue().clone();
-        let fallback_handler = FallbackTracksHandler {
-            queue,
-            driver: Arc::clone(&handle_lock),
+    handle.add_global_event(
+        Event::Track(TrackEvent::Play),
+        TrackStartNotifier {
+            channel_id: msg.channel_id,
             ctx: ctx.clone(),
-            guild_id: msg.guild_id.expect("Command only allowed in guilds"),
-        };
-        handle.add_global_event(Event::Track(TrackEvent::End), fallback_handler.clone());
-        handle.add_global_event(Event::Delayed(Duration::from_secs(30)), fallback_handler);
-    } else {
-        check_msg(
-            msg.channel_id
-                .say(&ctx.http, "Error joining the channel")
-                .await,
-        );
-    }
+        },
+    );
+    let queue = handle.queue().clone();
+    let fallback_handler = FallbackTracksHandler {
+        queue,
+        driver: Arc::clone(&handle_lock),
+        ctx: ctx.clone(),
+        guild_id: msg.guild_id.expect("Command only allowed in guilds"),
+    };
+    handle.add_global_event(Event::Track(TrackEvent::End), fallback_handler.clone());
+    handle.add_global_event(Event::Delayed(Duration::from_secs(30)), fallback_handler);
 
     Ok(())
 }
