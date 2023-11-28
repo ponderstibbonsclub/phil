@@ -29,7 +29,7 @@ use serenity::{
         standard::{
             help_commands,
             macros::{command, group, help},
-            Args, CommandGroup, CommandResult, HelpOptions,
+            Args, Configuration, CommandGroup, CommandResult, HelpOptions,
         },
         StandardFramework,
     },
@@ -358,7 +358,7 @@ async fn main() -> anyhow::Result<()> {
         match info.team {
             Some(team) => owners.extend(team.members.iter().map(|tm| tm.user.id)),
             None => {
-                owners.insert(info.owner.id);
+                owners.insert(info.owner.expect("must be owned").id);
             }
         }
 
@@ -372,11 +372,11 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let framework = StandardFramework::new().help(&HELP).group(&GENERAL_GROUP);
-    framework.configure(|c| {
-        c.prefixes([".", "~"])
+    framework.configure(
+        Configuration::new().prefixes([".", "~"])
             .owners(owners)
             .on_mention(Some(bot_id))
-    });
+    );
 
     let intents = GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::GUILDS
@@ -387,7 +387,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut client = Client::builder(&token, intents)
         .event_handler(Handler)
-        .application_id(app_id.0.into())
+        .application_id(app_id)
         .framework(framework)
         .register_songbird()
         .type_map_insert::<HttpKey>(HttpClient::new())
@@ -545,7 +545,7 @@ async fn add_fallback(ctx: &DiscordContext, msg: &Message, args: Args) -> Comman
     };
 
     static YT_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"^.*(?:(?:youtu\.be/|v/|vi/|u/\w/|embed/|shorts/)|(?:(?:watch)?\?v(?:i)?=|\&v(?:i)?=))([^#\&\?]*).*").expect("regex should be valid")
+        Regex::new(r"^.*(?:(?:youtu\.be/|v/|vi/|u/\w/|embed/|shorts/)|(?:(?:watch)?\?vi?=|&vi?=))([^#&?]*).*").expect("regex should be valid")
     });
 
     let url = meta
@@ -682,7 +682,7 @@ async fn play(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult 
         let mut source = if query.starts_with("http") {
             YoutubeDl::new(http_client, query)
         } else {
-            YoutubeDl::new(http_client, format!("ytsearch:{}", query))
+            YoutubeDl::new(http_client, format!("ytsearch:{query}"))
         };
 
         let Ok(meta) = source.aux_metadata().await else {
@@ -764,7 +764,7 @@ async fn playi(ctx: &DiscordContext, msg: &Message, args: Args) -> CommandResult
         let mut source = if query.starts_with("http") {
             YoutubeDl::new(http_client, query)
         } else {
-            YoutubeDl::new(http_client, format!("ytsearch:{}", query))
+            YoutubeDl::new(http_client, format!("ytsearch:{query}"))
         };
 
         let Ok(meta) = source.aux_metadata().await else {
@@ -1000,13 +1000,13 @@ async fn remove(ctx: &DiscordContext, msg: &Message, mut args: Args) -> CommandR
             let _ = track.stop();
             check_msg(
                 msg.channel_id
-                    .say(&ctx.http, format!("Removed {} from queue", position))
+                    .say(&ctx.http, format!("Removed {position} from queue"))
                     .await,
             );
         } else {
             check_msg(
                 msg.channel_id
-                    .say(&ctx.http, format!("Track not found: {}", position))
+                    .say(&ctx.http, format!("Track not found: {position}"))
                     .await,
             );
         }
@@ -1071,7 +1071,7 @@ async fn skip(ctx: &DiscordContext, msg: &Message, _args: Args) -> CommandResult
         let queue = handler.queue();
 
         if queue.is_empty() {
-            check_msg(msg.channel_id.say(&ctx, format!("No songs in queue")).await);
+            check_msg(msg.channel_id.say(&ctx, "No songs in queue").await);
             return Ok(());
         }
 
@@ -1217,7 +1217,7 @@ async fn volume(ctx: &DiscordContext, msg: &Message, mut args: Args) -> CommandR
 /// Checks that a message successfully sent; if not, then logs why using tracing.
 fn check_msg<T>(result: SerenityResult<T>) {
     if let Err(why) = result {
-        tracing::error!("Error sending message: {:?}", why);
+        error!("Error sending message: {why:?}");
     }
 }
 
@@ -1241,7 +1241,7 @@ fn track_embed(meta: &AuxMetadata, pos: QueuePos, blame: Option<Blame>) -> Creat
         QueuePos::Now => embed.title("🎵 Now Playing 🎵").colour(Colour::DARK_GREEN),
         QueuePos::Next => embed.title("Next Up").colour(Colour::DARK_GREEN),
         QueuePos::Later(pos) => embed
-            .title(format!("Queued at {}", pos))
+            .title(format!("Queued at {pos}"))
             .colour(Colour::GOLD),
         QueuePos::Fallback => embed.title("Add as fallback?").colour(Colour::LIGHT_GREY),
     };
@@ -1254,7 +1254,7 @@ fn track_embed(meta: &AuxMetadata, pos: QueuePos, blame: Option<Blame>) -> Creat
     }
     desc.push('\n');
     if let Some(artist) = &meta.artist {
-        desc.push_str(&format!("By {}", artist));
+        desc.push_str(&format!("By {artist}"));
     }
     embed = embed.description(desc);
 
